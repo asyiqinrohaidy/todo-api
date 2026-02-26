@@ -1,4 +1,4 @@
-# AI-Powered Task Manager - Backend API
+# Athena (AI-Powered Task Manager) - Backend API
 
 Laravel-based REST API powering an intelligent task management system with AI collaboration, document parsing, and smart analysis.
 

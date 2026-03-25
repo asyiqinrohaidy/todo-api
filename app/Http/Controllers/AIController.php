@@ -4,538 +4,823 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Auth;
 use App\Models\Task;
+use Carbon\Carbon;
 
 class AIController extends Controller
 {
-    private $openaiKey;
+    // Ollama Configuration
+    private $ollamaUrl = 'http://localhost:11434/api/generate';
+    private $ollamaModel = 'llama3.2';
 
-    public function __construct()
+    /**
+     * Add CORS headers to response
+     */
+    private function corsResponse($data, $status = 200)
     {
-        $this->openaiKey = env('OPENAI_API_KEY');
+        return response()->json($data, $status)
+            ->header('Access-Control-Allow-Origin', '*')
+            ->header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+            ->header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept')
+            ->header('Access-Control-Allow-Credentials', 'true');
     }
 
     /**
-     * Chat with AI assistant (with function calling)
+     * Call Ollama LLaMA API with timeout protection
      */
-    public function chat(Request $request)
+    private function callOllama($prompt, $temperature = 0.2, $maxTokens = 500)
     {
-        $validated = $request->validate([
-            'message' => 'required|string',
-            'conversation_history' => 'array|nullable'
-        ]);
-
-        $userMessage = $validated['message'];
-        $history = $validated['conversation_history'] ?? [];
-
         try {
-            // Get user's current tasks for context (FRESH data every time)
-            $currentTasks = $request->user()->tasks()->get();
-            
-            // Call AI with function calling capability
-            $result = $this->callOpenAIWithTools($userMessage, $history, $currentTasks, $request->user());
-
-            return response()->json([
-                'success' => true,
-                'data' => [
-                    'message' => $result['message'],
-                    'actions_taken' => $result['actions'] ?? [],
-                    'timestamp' => now()
-                ]
-            ]);
-
-        } catch (\Exception $e) {
-            return response()->json([
-                'success' => false,
-                'message' => 'AI request failed: ' . $e->getMessage()
-            ], 500);
-        }
-    }
-
-    /**
-     * Call OpenAI with function calling (Standard API)
-     */
-    private function callOpenAIWithTools($userMessage, $history, $currentTasks, $user)
-    {
-        // Calculate fresh counts
-        $totalCount = $currentTasks->count();
-        $completedCount = $currentTasks->where('is_completed', true)->count();
-        $pendingCount = $currentTasks->where('is_completed', false)->count();
-
-        // Debug logging
-        \Log::info('AI Chat - Fresh Task Data', [
-            'user_id' => $user->id,
-            'total_tasks' => $totalCount,
-            'completed_tasks' => $completedCount,
-            'pending_tasks' => $pendingCount,
-            'user_message' => $userMessage
-        ]);
-
-        // Build system context with current tasks
-        $tasksList = $currentTasks->map(function($task) {
-            $status = $task->is_completed ? 'completed' : 'pending';
-            return "[ID: {$task->id}] {$task->title} ({$status})";
-        })->join("\n");
-
-        $systemPrompt = "You are a helpful task management assistant for {$user->name}.
-
-CURRENT TASKS ({$totalCount} total, {$completedCount} completed, {$pendingCount} pending):
-{$tasksList}
-
-CRITICAL INSTRUCTIONS:
-1. When counting tasks, use EXACTLY these numbers: {$totalCount} total, {$completedCount} completed, {$pendingCount} pending
-2. When deleting by name, search CASE-INSENSITIVELY and return the task ID
-3. You CAN delete multiple tasks at once - use the 'delete_multiple' action
-4. You CAN create multiple tasks at once - use the 'create_multiple_tasks' action
-5. When creating tasks, ALWAYS ask for a due date if not provided
-6. Always be accurate - the task list above is the CURRENT, LIVE source of truth
-7. Respond in JSON format only
-
-You can help users manage their tasks by:
-1. Listing their current tasks
-2. Creating single or multiple tasks (with smart defaults)
-3. Marking tasks as complete/incomplete
-4. Deleting single tasks (by ID or name)
-5. Deleting multiple tasks at once (by status or IDs)
-
-TASK CREATION RULES:
-- If user provides ONLY a task title (no due date), use action \"ask_for_details\" to ask when it's due
-- If user provides task title AND due date, use action \"create_task_smart\" to create with AI analysis
-- If user wants to create MULTIPLE tasks, use action \"create_multiple_tasks\" with an array of tasks
-- The system will automatically analyze and set priority + estimated hours
-
-RESPONSE FORMAT (respond with ONLY valid JSON):
-{
-  \"action\": \"create_task_smart\" | \"create_multiple_tasks\" | \"ask_for_details\" | \"complete_task\" | \"delete_task\" | \"delete_multiple\" | \"list_tasks\" | \"none\",
-  \"task_id\": 123,
-  \"task_ids\": [1, 2, 3],
-  \"task_title\": \"task name\",
-  \"due_date\": \"2026-02-27\",
-  \"tasks\": [
-    {\"title\": \"Task 1\", \"due_date\": \"2026-02-27\"},
-    {\"title\": \"Task 2\", \"due_date\": \"2026-02-28\"}
-  ],
-  \"delete_criteria\": \"completed\" | \"all\" | \"pending\",
-  \"response\": \"Your friendly message to the user\"
-}
-
-EXAMPLES:
-
-User: \"add a task to go jogging\"
-{\"action\": \"ask_for_details\", \"task_title\": \"Jogging\", \"response\": \"Sure! When would you like to complete 'Jogging'? (e.g., tomorrow, next week, Feb 28)\"}
-
-User: \"add jogging for tomorrow\"
-{\"action\": \"create_task_smart\", \"task_title\": \"Jogging\", \"due_date\": \"2026-02-27\", \"response\": \"I'll add 'Jogging' with a smart analysis!\"}
-
-User: \"create tasks for Market Research, Define Purpose, and Create Wireframe all due on May 26\"
-{\"action\": \"create_multiple_tasks\", \"tasks\": [{\"title\": \"Market Research\", \"due_date\": \"2026-05-26\"}, {\"title\": \"Define Purpose\", \"due_date\": \"2026-05-26\"}, {\"title\": \"Create Wireframe\", \"due_date\": \"2026-05-26\"}], \"response\": \"I'll create all these tasks!\"}
-
-User: \"how many tasks do I have?\"
-{\"action\": \"none\", \"response\": \"You have {$totalCount} tasks total ({$pendingCount} pending, {$completedCount} completed).\"}
-
-User: \"delete all completed tasks\"
-{\"action\": \"delete_multiple\", \"delete_criteria\": \"completed\", \"response\": \"I'll delete all completed tasks for you.\"}
-
-User: \"list all my tasks\"
-{\"action\": \"list_tasks\", \"response\": \"Here are your tasks:\"}
-
-User: \"delete praying\"
-{\"action\": \"delete_task\", \"task_title\": \"Praying\", \"response\": \"I've deleted 'Praying' from your tasks!\"}
-
-REMEMBER: When creating multiple tasks, use create_multiple_tasks action with a tasks array. Always ask for due dates when creating tasks, then use AI to analyze priority and estimated hours automatically.";
-
-        // Build messages array
-        $messages = [];
-        
-        // Add system message
-        $messages[] = [
-            'role' => 'system',
-            'content' => $systemPrompt
-        ];
-
-        // Add conversation history
-        foreach ($history as $msg) {
-            if (isset($msg['role']) && isset($msg['content'])) {
-                $messages[] = [
-                    'role' => $msg['role'] === 'assistant' ? 'assistant' : 'user',
-                    'content' => $msg['content']
-                ];
-            }
-        }
-
-        // Add new user message
-        $messages[] = [
-            'role' => 'user',
-            'content' => $userMessage
-        ];
-
-        // Call OpenAI Chat Completions API
-        $response = Http::timeout(60)
-            ->withHeaders([
-                'Authorization' => 'Bearer ' . $this->openaiKey,
-                'Content-Type'  => 'application/json',
-            ])
-            ->post('https://api.openai.com/v1/chat/completions', [
-                'model' => 'gpt-4o-mini',
-                'messages' => $messages,
-                'temperature' => 0.3,
-                'max_tokens' => 2048,
-            ]);
-
-        if ($response->failed()) {
-            \Log::error('OpenAI API Failed', ['body' => $response->body()]);
-            throw new \Exception('OpenAI API failed: ' . $response->body());
-        }
-
-        $data = $response->json();
-        
-        if (!isset($data['choices'][0]['message']['content'])) {
-            \Log::error('Invalid OpenAI Response', ['data' => $data]);
-            throw new \Exception('Invalid OpenAI response format');
-        }
-
-        $aiResponse = $data['choices'][0]['message']['content'];
-
-        // Log AI response
-        \Log::info('AI Response', ['response' => $aiResponse]);
-
-        // Try to parse as JSON
-        $aiResponse = trim($aiResponse);
-        
-        // Remove markdown code blocks if present
-        $aiResponse = preg_replace('/```json\s*/i', '', $aiResponse);
-        $aiResponse = preg_replace('/```\s*$/i', '', $aiResponse);
-        $aiResponse = trim($aiResponse);
-
-        // Extract JSON from response
-        $firstBrace = strpos($aiResponse, '{');
-        $lastBrace = strrpos($aiResponse, '}');
-        
-        if ($firstBrace !== false && $lastBrace !== false) {
-            $jsonStr = substr($aiResponse, $firstBrace, $lastBrace - $firstBrace + 1);
-            $parsed = json_decode($jsonStr, true);
-        } else {
-            $parsed = json_decode($aiResponse, true);
-        }
-
-        // If not JSON, treat as plain text
-        if (!$parsed) {
-            return [
-                'message' => $aiResponse,
-                'actions' => []
-            ];
-        }
-
-        // Execute the action
-        $actionsTaken = [];
-        
-        switch ($parsed['action'] ?? 'none') {
-            case 'ask_for_details':
-                // Just return the AI's question asking for more details
-                // No action taken, waiting for user response
-                break;
-
-            case 'create_task_smart':
-                if (isset($parsed['task_title'])) {
-                    $title = $parsed['task_title'];
-                    $dueDate = $parsed['due_date'] ?? null;
-                    
-                    // Call AI to analyze the task
-                    $analysis = $this->analyzeTaskInternal($title, $dueDate, $user);
-                    
-                    // Create task with smart defaults
-                    $task = $user->tasks()->create([
-                        'title' => $title,
-                        'due_date' => $dueDate,
-                        'priority' => $analysis['priority'],
-                        'estimated_hours' => $analysis['estimated_hours'],
-                        'is_completed' => false
-                    ]);
-                    
-                    $actionsTaken[] = "Created task: {$task->title}";
-                    $parsed['response'] = "✅ I've added '{$title}' to your tasks!\n\n🤖 AI Analysis:\n- Priority: " . strtoupper($analysis['priority']) . "\n- Estimated: {$analysis['estimated_hours']} hours\n- Reason: {$analysis['reasoning']}";
-                }
-                break;
-
-            case 'create_multiple_tasks':
-                if (isset($parsed['tasks']) && is_array($parsed['tasks'])) {
-                    $createdTasks = [];
-                    
-                    foreach ($parsed['tasks'] as $taskData) {
-                        if (!isset($taskData['title'])) continue;
-                        
-                        $title = $taskData['title'];
-                        $dueDate = $taskData['due_date'] ?? null;
-                        
-                        // Call AI to analyze each task
-                        $analysis = $this->analyzeTaskInternal($title, $dueDate, $user);
-                        
-                        // Create task with smart defaults
-                        $task = $user->tasks()->create([
-                            'title' => $title,
-                            'due_date' => $dueDate,
-                            'priority' => $analysis['priority'],
-                            'estimated_hours' => $analysis['estimated_hours'],
-                            'is_completed' => false
-                        ]);
-                        
-                        $createdTasks[] = [
-                            'title' => $task->title,
-                            'priority' => strtoupper($analysis['priority']),
-                            'estimated_hours' => $analysis['estimated_hours']
-                        ];
-                    }
-                    
-                    $count = count($createdTasks);
-                    $taskSummary = array_map(function($t) {
-                        $emoji = ['HIGH' => '🔴', 'MEDIUM' => '🟡', 'LOW' => '🟢'][$t['priority']] ?? '';
-                        return "✅ {$t['title']} ({$emoji} {$t['priority']}, {$t['estimated_hours']}h)";
-                    }, $createdTasks);
-                    
-                    $actionsTaken[] = "Created {$count} tasks";
-                    $parsed['response'] = "🎉 I've created {$count} tasks with AI analysis!\n\n" . implode("\n", $taskSummary);
-                }
-                break;
-            
-            case 'list_tasks':
-                // Format tasks as a nice string response
-                $taskList = $currentTasks->map(function($task) {
-                    $status = $task->is_completed ? '✅' : '⬜';
-                    $priority = '';
-                    if ($task->priority) {
-                        $priorityLabel = strtoupper($task->priority);
-                        $emoji = [
-                            'HIGH' => '🔴',
-                            'MEDIUM' => '🟡',
-                            'LOW' => '🟢'
-                        ][$priorityLabel] ?? '';
-                        $priority = "{$emoji} {$priorityLabel} - ";
-                    }
-                    return "{$status} {$priority}{$task->title}";
-                })->join("\n");
-                
-                if ($currentTasks->isEmpty()) {
-                    $parsed['response'] = "You don't have any tasks yet! 🎉 Would you like me to create one?";
-                } else {
-                    $parsed['response'] = "Here are your tasks:\n\n{$taskList}\n\nTotal: {$totalCount} tasks ({$pendingCount} pending, {$completedCount} completed)";
-                }
-                $actionsTaken[] = "Listed all tasks";
-                break;
-
-            case 'complete_task':
-                if (isset($parsed['task_id'])) {
-                    $task = $user->tasks()->find($parsed['task_id']);
-                    if ($task) {
-                        $task->update(['is_completed' => true]);
-                        $actionsTaken[] = "Completed task: {$task->title}";
-                    } else {
-                        $parsed['response'] = "I couldn't find task ID {$parsed['task_id']}.";
-                    }
-                }
-                break;
-
-            case 'delete_task':
-                $task = null;
-                
-                // Try to find by ID first
-                if (isset($parsed['task_id'])) {
-                    $task = $user->tasks()->find($parsed['task_id']);
-                }
-                
-                // If no ID provided or not found, try to find by title (case-insensitive)
-                if (!$task && isset($parsed['task_title'])) {
-                    $task = $user->tasks()
-                        ->whereRaw('LOWER(title) = ?', [strtolower($parsed['task_title'])])
-                        ->first();
-                }
-                
-                if ($task) {
-                    $title = $task->title;
-                    $task->delete();
-                    $actionsTaken[] = "Deleted task: {$title}";
-                    $parsed['response'] = "I've deleted '{$title}' from your tasks!";
-                } else {
-                    $searchTerm = $parsed['task_title'] ?? $parsed['task_id'] ?? 'that task';
-                    $parsed['response'] = "I couldn't find a task matching '{$searchTerm}'. Could you be more specific?";
-                }
-                break;
-
-            case 'delete_multiple':
-                $deletedTasks = [];
-                $criteria = $parsed['delete_criteria'] ?? null;
-                
-                if ($criteria === 'completed') {
-                    $tasksToDelete = $user->tasks()->where('is_completed', true)->get();
-                } elseif ($criteria === 'all') {
-                    $tasksToDelete = $user->tasks()->get();
-                } elseif ($criteria === 'pending') {
-                    $tasksToDelete = $user->tasks()->where('is_completed', false)->get();
-                } elseif (isset($parsed['task_ids']) && is_array($parsed['task_ids'])) {
-                    $tasksToDelete = $user->tasks()->whereIn('id', $parsed['task_ids'])->get();
-                } else {
-                    $tasksToDelete = collect();
-                }
-                
-                if ($tasksToDelete->isNotEmpty()) {
-                    foreach ($tasksToDelete as $task) {
-                        $deletedTasks[] = $task->title;
-                    }
-                    $tasksToDelete->each->delete();
-                    
-                    $count = count($deletedTasks);
-                    $actionsTaken[] = "Deleted {$count} tasks: " . implode(', ', $deletedTasks);
-                    $parsed['response'] = "I've deleted {$count} task" . ($count > 1 ? 's' : '') . ": " . implode(', ', $deletedTasks);
-                } else {
-                    $parsed['response'] = "I couldn't find any tasks matching that criteria.";
-                }
-                break;
-        }
-
-        // Log final action
-        \Log::info('AI Action Executed', [
-            'action' => $parsed['action'] ?? 'none',
-            'actions_taken' => $actionsTaken
-        ]);
-
-        return [
-            'message' => $parsed['response'] ?? $aiResponse,
-            'actions' => $actionsTaken
-        ];
-    }
-
-    /**
-     * Internal method to analyze task (used by chat) - OpenAI version
-     */
-    private function analyzeTaskInternal($title, $dueDate, $user)
-    {
-        $currentTasks = $user->tasks()->where('is_completed', false)->get();
-        $taskCount = $currentTasks->count();
-
-        $daysUntilDue = 'Not set';
-        if ($dueDate) {
-            $daysUntilDue = now()->diffInDays($dueDate, false);
-            $daysUntilDue = $daysUntilDue . ' days';
-        }
-
-        $prompt = "Analyze this task and determine priority and estimated hours.
-
-TASK: {$title}
-DUE: {$daysUntilDue}
-WORKLOAD: {$taskCount} pending tasks
-
-PRIORITY RULES:
-- HIGH: Due in 0-2 days OR urgent keywords
-- MEDIUM: Due in 3-7 days OR moderate task
-- LOW: Due in 8+ days OR simple task
-
-ESTIMATION RULES:
-- Simple tasks: 0.5-2 hours
-- Medium tasks: 2-8 hours
-- Complex tasks: 8-40 hours
-
-Respond ONLY with this JSON (no markdown, no explanation):
-{
-  \"priority\": \"high\",
-  \"estimated_hours\": 2,
-  \"reasoning\": \"Brief explanation\"
-}";
-
-        try {
-            // Call OpenAI for analysis
             $response = Http::timeout(30)
-                ->withHeaders([
-                    'Authorization' => 'Bearer ' . $this->openaiKey,
-                    'Content-Type'  => 'application/json',
-                ])
-                ->post('https://api.openai.com/v1/chat/completions', [
-                    'model' => 'gpt-4o-mini',
-                    'messages' => [
-                        ['role' => 'system', 'content' => 'You are a task analysis AI. Respond only with valid JSON.'],
-                        ['role' => 'user', 'content' => $prompt]
-                    ],
-                    'temperature' => 0.3,
-                    'max_tokens' => 500,
+                ->post($this->ollamaUrl, [
+                    'model' => $this->ollamaModel,
+                    'prompt' => $prompt,
+                    'stream' => false,
+                    'options' => [
+                        'temperature' => $temperature,
+                        'num_predict' => $maxTokens,
+                    ]
                 ]);
 
             if ($response->failed()) {
-                throw new \Exception('AI analysis failed');
+                Log::error('Ollama request failed', [
+                    'status' => $response->status(),
+                    'body' => $response->body()
+                ]);
+                return null;
             }
 
             $data = $response->json();
-            $aiResponse = $data['choices'][0]['message']['content'] ?? '';
+            return $data['response'] ?? null;
 
-            // Clean response
-            $aiResponse = trim($aiResponse);
-            $aiResponse = preg_replace('/```json\s*/i', '', $aiResponse);
-            $aiResponse = preg_replace('/```\s*$/i', '', $aiResponse);
-
-            // Extract JSON
-            $firstBrace = strpos($aiResponse, '{');
-            $lastBrace = strrpos($aiResponse, '}');
-            
-            if ($firstBrace !== false && $lastBrace !== false) {
-                $aiResponse = substr($aiResponse, $firstBrace, $lastBrace - $firstBrace + 1);
-            }
-
-            $analysis = json_decode(trim($aiResponse), true);
-
-            if ($analysis) {
-                return [
-                    'priority' => $analysis['priority'] ?? 'medium',
-                    'estimated_hours' => $analysis['estimated_hours'] ?? 2,
-                    'reasoning' => $analysis['reasoning'] ?? 'AI analysis complete'
-                ];
-            }
         } catch (\Exception $e) {
-            \Log::error('Task analysis failed', ['error' => $e->getMessage()]);
+            Log::error('Ollama Error: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Analyze task using LLaMA (with fallback)
+     */
+    private function analyzeTaskInternal($title, $dueDate = null, $taskCount = 0)
+    {
+        $now = now();
+        $daysUntilDue = null;
+
+        // Parse due date
+        if ($dueDate) {
+            try {
+                $dueDateCarbon = Carbon::parse($dueDate);
+                $daysUntilDue = $now->diffInDays($dueDateCarbon, false);
+            } catch (\Exception $e) {
+                Log::warning("Invalid due date: {$dueDate}");
+            }
         }
 
-        // Fallback to rule-based
-        $priority = 'medium';
-        $estimatedHours = 2;
+        // Try AI analysis with timeout protection
+        try {
+            $prompt = $this->buildAnalysisPrompt($title, $daysUntilDue, $now, $taskCount);
+            $aiResponse = $this->callOllama($prompt, 0.2, 300);
 
-        if ($dueDate) {
-            $days = now()->diffInDays($dueDate, false);
-            if ($days <= 2) {
+            if (!$aiResponse) {
+                throw new \Exception('LLaMA returned null');
+            }
+
+            $parsed = $this->parseAIResponse($aiResponse);
+
+            // Validate priority against business rules
+            if ($daysUntilDue !== null) {
+                $parsed = $this->validatePriority($parsed, $daysUntilDue);
+            }
+
+            return $parsed;
+
+        } catch (\Exception $e) {
+            Log::warning('LLaMA analysis failed, using fallback', ['error' => $e->getMessage()]);
+            return $this->fallbackAnalysis($daysUntilDue);
+        }
+    }
+
+    /**
+     * Build analysis prompt for LLaMA
+     */
+    private function buildAnalysisPrompt($title, $daysUntilDue, $now, $taskCount)
+    {
+        $currentDate = $now->format('Y-m-d (l)');
+        
+        if ($daysUntilDue !== null) {
+            if ($daysUntilDue < 0) {
+                $dueDateInfo = "OVERDUE by " . abs($daysUntilDue) . " days";
+            } elseif ($daysUntilDue == 0) {
+                $dueDateInfo = "Due TODAY";
+            } elseif ($daysUntilDue == 1) {
+                $dueDateInfo = "Due TOMORROW";
+            } else {
+                $dueDateInfo = "Due in {$daysUntilDue} days";
+            }
+        } else {
+            $dueDateInfo = "No due date specified";
+        }
+
+        return <<<PROMPT
+Analyze this task. Respond ONLY with JSON, no markdown.
+
+TASK: "{$title}"
+DUE: {$dueDateInfo}
+DATE: {$currentDate}
+
+JSON:
+{
+  "priority": "high/medium/low",
+  "estimated_hours": 2,
+  "reasoning": "Brief reason"
+}
+PROMPT;
+    }
+
+    /**
+     * Parse LLaMA response
+     */
+    private function parseAIResponse($response)
+    {
+        $cleaned = preg_replace('/```json\s*/i', '', $response);
+        $cleaned = preg_replace('/```\s*/i', '', $cleaned);
+        $cleaned = trim($cleaned);
+
+        if (preg_match('/\{[^}]*"priority"[^}]*\}/s', $cleaned, $matches)) {
+            $cleaned = $matches[0];
+        }
+
+        try {
+            $parsed = json_decode($cleaned, true);
+
+            if (!$parsed || !isset($parsed['priority'])) {
+                throw new \Exception('Invalid JSON structure');
+            }
+
+            return [
+                'priority' => strtolower($parsed['priority'] ?? 'medium'),
+                'estimated_hours' => floatval($parsed['estimated_hours'] ?? 2),
+                'reasoning' => $parsed['reasoning'] ?? 'AI analysis completed'
+            ];
+
+        } catch (\Exception $e) {
+            throw new \Exception('JSON parsing failed');
+        }
+    }
+
+    /**
+     * Validate AI priority against business rules
+     */
+    private function validatePriority($parsed, $daysUntilDue)
+    {
+        $aiPriority = $parsed['priority'];
+        $expectedPriority = null;
+
+        if ($daysUntilDue < 0) {
+            $expectedPriority = 'high';
+        } elseif ($daysUntilDue <= 2) {
+            $expectedPriority = 'high';
+        } elseif ($daysUntilDue <= 7) {
+            $expectedPriority = 'medium';
+        } else {
+            $expectedPriority = 'low';
+        }
+
+        if ($aiPriority !== $expectedPriority) {
+            $parsed['priority'] = $expectedPriority;
+            $parsed['reasoning'] .= " (Validated)";
+        }
+
+        return $parsed;
+    }
+
+    /**
+     * Fallback rule-based analysis
+     */
+    private function fallbackAnalysis($daysUntilDue)
+    {
+        $priority = 'medium';
+        $hours = 2;
+
+        if ($daysUntilDue !== null) {
+            if ($daysUntilDue < 0 || $daysUntilDue <= 2) {
                 $priority = 'high';
-                $estimatedHours = 1;
-            } elseif ($days <= 7) {
+                $hours = 4;
+            } elseif ($daysUntilDue <= 7) {
                 $priority = 'medium';
-                $estimatedHours = 2;
+                $hours = 3;
             } else {
                 $priority = 'low';
-                $estimatedHours = 1;
+                $hours = 2;
             }
         }
 
         return [
             'priority' => $priority,
-            'estimated_hours' => $estimatedHours,
-            'reasoning' => 'Auto-determined based on due date'
+            'estimated_hours' => $hours,
+            'reasoning' => 'Rule-based analysis'
         ];
     }
 
     /**
-     * Analyze task and suggest priority & estimated hours (API endpoint)
-     * POST /api/ai/analyze-task
+     * API Endpoint: Analyze Task (with CORS and timeout protection)
      */
     public function analyzeTask(Request $request)
     {
-        $validated = $request->validate([
-            'title' => 'required|string',
-            'due_date' => 'nullable|date',
-            'description' => 'nullable|string'
-        ]);
+        try {
+            $request->validate([
+                'task_title' => 'required|string|max:255',
+                'due_date' => 'nullable|date'
+            ]);
 
-        $result = $this->analyzeTaskInternal(
-            $validated['title'],
-            $validated['due_date'] ?? null,
-            $request->user()
-        );
+            $user = Auth::user();
+            $taskCount = $user ? Task::where('user_id', $user->id)->where('is_completed', false)->count() : 0;
 
-        return response()->json([
-            'success' => true,
-            'data' => $result
-        ]);
+            $analysis = $this->analyzeTaskInternal(
+                $request->task_title,
+                $request->due_date,
+                $taskCount
+            );
+
+            return $this->corsResponse([
+                'success' => true,
+                'data' => $analysis
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('analyzeTask error: ' . $e->getMessage());
+            
+            return $this->corsResponse([
+                'success' => true,
+                'data' => [
+                    'priority' => 'medium',
+                    'estimated_hours' => 2,
+                    'reasoning' => 'Default analysis'
+                ]
+            ]);
+        }
+    }
+
+    /**
+     * CHAT: NO LLAMA VERSION (Fast & Reliable)
+     */
+    public function chat(Request $request)
+    {
+        try {
+            $request->validate([
+                'message' => 'required|string',
+                'conversation_history' => 'nullable|array'
+            ]);
+
+            $userMessage = $request->message;
+            $user = Auth::user();
+
+            // Detect and execute actions
+            $actions = $this->detectAndExecuteActions($userMessage, $user);
+
+            // If actions executed, return summary
+            if (!empty($actions)) {
+                $actionSummary = $this->buildActionSummary($actions);
+                
+                return $this->corsResponse([
+                    'success' => true,
+                    'data' => [
+                        'message' => $actionSummary,
+                        'response' => $actionSummary,
+                        'actions_taken' => $actions
+                    ]
+                ]);
+            }
+
+            // Get simple response (no AI)
+            $response = $this->getSimpleResponse($userMessage);
+            
+            if (!$response) {
+                $response = "I can help you manage your tasks! Try:\n\n• 'create task [title] tomorrow'\n• 'list my tasks'\n• 'complete task [title]'\n• 'delete all tasks'\n• 'how many tasks do I have?'\n\nWhat would you like to do?";
+            }
+
+            return $this->corsResponse([
+                'success' => true,
+                'data' => [
+                    'message' => $response,
+                    'response' => $response,
+                    'actions_taken' => []
+                ]
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Chat error: ' . $e->getMessage());
+            
+            return $this->corsResponse([
+                'success' => true,
+                'data' => [
+                    'message' => "I'm ready to help manage your tasks!",
+                    'response' => "I'm ready to help manage your tasks!",
+                    'actions_taken' => []
+                ]
+            ]);
+        }
+    }
+
+    /**
+     * Simple rule-based responses (no AI needed)
+     */
+    private function getSimpleResponse($message)
+    {
+        $lower = strtolower($message);
+        
+        // Greetings
+        if (preg_match('/^(hello|hi|hey|good morning|good afternoon|good evening)/i', $lower)) {
+            return "Hello! I'm your AI task assistant. I can help you create, manage, and organize your tasks. What would you like to do?";
+        }
+        
+        // Who are you
+        if (preg_match('/who are you|what are you|tell me about yourself/i', $lower)) {
+            return "I'm an AI-powered task management assistant built by Fulkrum Interactive. I help you manage tasks through natural conversation using advanced AI technology. You can ask me to create tasks, list tasks, complete them, or delete them. How can I help you today?";
+        }
+        
+        // Help
+        if (preg_match('/help|what can you do|commands/i', $lower)) {
+            return "I can help you with:\n\n• Create tasks: 'create task to read book tomorrow'\n• List tasks: 'show my tasks'\n• Complete tasks: 'complete task read book'\n• Delete tasks: 'delete all tasks'\n• Get stats: 'how many tasks do I have?'\n\nJust tell me what you need in natural language!";
+        }
+        
+        // Thank you
+        if (preg_match('/thank you|thanks|appreciate/i', $lower)) {
+            return "You're welcome! Let me know if you need anything else.";
+        }
+        
+        // Goodbye
+        if (preg_match('/bye|goodbye|see you/i', $lower)) {
+            return "Goodbye! Feel free to come back anytime you need help with your tasks. Have a great day! 👋";
+        }
+        
+        // Return null if no simple response matches
+        return null;
+    }
+
+    /**
+     * SUPER FLEXIBLE: Detect user intent and execute actions with WORD BOUNDARIES
+     */
+    private function detectAndExecuteActions($message, $user)
+    {
+        if (!$user) return [];
+
+        $actions = [];
+        $lowerMessage = strtolower($message);
+
+        // ========================================
+        // 1. DELETE TASKS (Flexible)
+        // ========================================
+        
+        // Delete all tasks
+        if (preg_match('/delete\s+(all|everything|all tasks)/i', $message)) {
+            if (preg_match('/completed/i', $message)) {
+                $deleted = Task::where('user_id', $user->id)
+                              ->where('is_completed', true)
+                              ->delete();
+                $actions[] = [
+                    'action' => 'delete_completed',
+                    'count' => $deleted
+                ];
+                Log::info('Deleted completed tasks', ['count' => $deleted]);
+            } else {
+                $deleted = Task::where('user_id', $user->id)->delete();
+                $actions[] = [
+                    'action' => 'delete_all',
+                    'count' => $deleted
+                ];
+                Log::info('Deleted all tasks', ['count' => $deleted]);
+            }
+        }
+        // Delete specific task by title
+        elseif (preg_match('/delete/i', $message)) {
+            // Extract task title - remove "delete", "task", "the"
+            $searchTerm = preg_replace('/(delete|task|the)\s*/i', '', $message);
+            $searchTerm = trim($searchTerm);
+            
+            if ($searchTerm && !in_array(strtolower($searchTerm), ['all', 'everything', 'all tasks'])) {
+                $task = Task::where('user_id', $user->id)
+                            ->where('title', 'LIKE', "%{$searchTerm}%")
+                            ->first();
+                
+                if ($task) {
+                    $taskTitle = $task->title;
+                    $task->delete();
+                    $actions[] = [
+                        'action' => 'delete_task',
+                        'task' => $taskTitle
+                    ];
+                    Log::info('Deleted task', ['title' => $taskTitle]);
+                }
+            }
+        }
+
+        // ========================================
+        // 2. COMPLETE TASKS (Flexible)
+        // ========================================
+        
+        // Complete all tasks
+        if (preg_match('/complete\s+(all|everything|all tasks)/i', $message)) {
+            $updated = Task::where('user_id', $user->id)
+                          ->where('is_completed', false)
+                          ->update(['is_completed' => true]);
+            $actions[] = [
+                'action' => 'complete_all',
+                'count' => $updated
+            ];
+            Log::info('Completed all tasks', ['count' => $updated]);
+        }
+        // Mark as done/finished (alternative phrases)
+        elseif (preg_match('/(?:complete|done|finish|finished|mark as done|mark as complete)/i', $message)) {
+            // Extract task title - remove action words
+            $searchTerm = preg_replace('/(complete|done|finish|finished|mark as done|mark as complete|task|the)\s*/i', '', $message);
+            $searchTerm = trim($searchTerm);
+            
+            if ($searchTerm && !in_array(strtolower($searchTerm), ['all', 'everything', 'all tasks'])) {
+                $task = Task::where('user_id', $user->id)
+                            ->where('is_completed', false)
+                            ->where('title', 'LIKE', "%{$searchTerm}%")
+                            ->first();
+                
+                if ($task) {
+                    $task->is_completed = true;
+                    $task->save();
+                    $actions[] = [
+                        'action' => 'complete_task',
+                        'task' => $task->title
+                    ];
+                    Log::info('Completed task', ['title' => $task->title]);
+                }
+            }
+        }
+
+        // ========================================
+        // 3. CREATE TASK (Fixed with word boundaries)
+        // ========================================
+        
+        if (preg_match('/\b(create|add|new|make)\b/i', $lowerMessage) && preg_match('/\btask\b/i', $lowerMessage)) {
+            $title = null;
+            $dueDate = null;
+            
+            // Step-by-step extraction with word boundaries
+            $workingText = $message;
+            
+            // Remove polite phrases at the start (whole words only)
+            $workingText = preg_replace('/^\s*(can you|could you|please|would you|will you)\s+/i', '', $workingText);
+            
+            // Remove action words (whole words only)
+            $workingText = preg_replace('/\b(create|add|new|make)\b\s*/i', '', $workingText);
+            
+            // Remove article "a" (whole word only)
+            $workingText = preg_replace('/\ba\b\s*/i', '', $workingText);
+            
+            // Remove "task" (whole word only)
+            $workingText = preg_replace('/\btask\b\s*/i', '', $workingText);
+            
+            // Remove "to" at the beginning or after space (whole word only)
+            $workingText = preg_replace('/^\s*\bto\b\s+/i', '', $workingText);
+            $workingText = preg_replace('/\s+\bto\b\s+/i', ' ', $workingText);
+            
+            // Remove date-related phrases at the end (whole words)
+            $workingText = preg_replace('/\s+(which is|that is)\s+(due\s+)?(tomorrow|today|next week|in \d+ days?)\s*$/i', '', $workingText);
+            $workingText = preg_replace('/\s+(due\s+)?(tomorrow|today|next week|in \d+ days?)\s*$/i', '', $workingText);
+            
+            // Remove standalone "which", "that", "is", "due" at the end
+            $workingText = preg_replace('/\s+(which|that|is|due)\s*$/i', '', $workingText);
+            
+            // Remove trailing commas
+            $workingText = preg_replace('/,\s*$/', '', $workingText);
+            
+            // Clean up extra spaces
+            $title = preg_replace('/\s+/', ' ', trim($workingText));
+            
+            Log::info('Task extraction', [
+                'original' => $message,
+                'extracted' => $title,
+                'length' => strlen($title)
+            ]);
+
+            if ($title && strlen($title) > 1) {
+                // Detect due date from ORIGINAL message
+                if (preg_match('/\btomorrow\b/i', $message)) {
+                    $dueDate = now()->addDay()->format('Y-m-d');
+                    Log::info('📅 Due: tomorrow', ['date' => $dueDate]);
+                } elseif (preg_match('/\btoday\b/i', $message)) {
+                    $dueDate = now()->format('Y-m-d');
+                    Log::info('📅 Due: today', ['date' => $dueDate]);
+                } elseif (preg_match('/next week/i', $message)) {
+                    $dueDate = now()->addWeek()->format('Y-m-d');
+                    Log::info('📅 Due: next week', ['date' => $dueDate]);
+                } elseif (preg_match('/in (\d+) days?/i', $message, $matches)) {
+                    $dueDate = now()->addDays((int)$matches[1])->format('Y-m-d');
+                    Log::info('📅 Due: in X days', ['days' => $matches[1], 'date' => $dueDate]);
+                }
+
+                // SMART PRIORITY DETECTION
+                $priority = 'medium';
+                $hasHighKeyword = preg_match('/\b(urgent|asap|critical|emergency|important|high priority)\b/i', $message);
+                $hasLowKeyword = preg_match('/\b(low priority|when you can|whenever|not urgent)\b/i', $message);
+                $dueDatePriority = null;
+                
+                if ($dueDate) {
+                    $daysUntilDue = now()->diffInDays(Carbon::parse($dueDate), false);
+                    
+                    if ($daysUntilDue < 0) {
+                        $dueDatePriority = 'high';
+                    } elseif ($daysUntilDue <= 2) {
+                        $dueDatePriority = 'high';
+                    } elseif ($daysUntilDue <= 7) {
+                        $dueDatePriority = 'medium';
+                    } else {
+                        $dueDatePriority = 'low';
+                    }
+                }
+                
+                if ($hasHighKeyword) {
+                    $priority = 'high';
+                } elseif ($hasLowKeyword) {
+                    $priority = 'low';
+                } elseif ($dueDatePriority) {
+                    $priority = $dueDatePriority;
+                } else {
+                    $priority = 'medium';
+                }
+                
+                Log::info('Priority determined', [
+                    'final' => $priority,
+                    'keyword_high' => $hasHighKeyword,
+                    'keyword_low' => $hasLowKeyword,
+                    'due_date_priority' => $dueDatePriority
+                ]);
+
+                // Create task
+                try {
+                    $task = Task::create([
+                        'user_id' => $user->id,
+                        'title' => $title,
+                        'due_date' => $dueDate,
+                        'priority' => $priority,
+                        'is_completed' => false
+                    ]);
+                    
+                    Log::info('Task created', [
+                        'id' => $task->id,
+                        'title' => $task->title,
+                        'due_date' => $task->due_date,
+                        'priority' => $task->priority
+                    ]);
+                    
+                    $actions[] = [
+                        'action' => 'create_task',
+                        'task' => $task->title,
+                        'due_date' => $task->due_date,
+                        'priority' => $task->priority
+                    ];
+                } catch (\Exception $e) {
+                    Log::error('Task creation failed', ['error' => $e->getMessage()]);
+                }
+            }
+        }
+
+        // ========================================
+        // 4. LIST TASKS (Flexible)
+        // ========================================
+        
+        if (preg_match('/(?:list|show|display|view|see|what are|get)\s*(?:my|all)?\s*(?:tasks?|to.?dos?)/i', $message) ||
+            preg_match('/what do i have to do/i', $message) ||
+            preg_match('/show me my list/i', $message)) {
+            
+            $tasks = Task::where('user_id', $user->id)
+                        ->where('is_completed', false)
+                        ->orderBy('priority', 'desc')
+                        ->orderBy('created_at', 'desc')
+                        ->limit(10)
+                        ->get(['title', 'priority', 'due_date']);
+            
+            $actions[] = [
+                'action' => 'list_tasks',
+                'tasks' => $tasks->toArray()
+            ];
+            
+            Log::info('Listed tasks', ['count' => $tasks->count()]);
+        }
+
+        // ========================================
+        // 5. GET STATS (Flexible)
+        // ========================================
+        
+        if (preg_match('/(?:how many|count|number of|total)\s*(?:tasks?|to.?dos?)/i', $message) ||
+            preg_match('/(?:task|todo)?\s*(?:stats|statistics|summary)/i', $message) ||
+            preg_match('/what.?s my progress/i', $message)) {
+            
+            $total = Task::where('user_id', $user->id)->count();
+            $pending = Task::where('user_id', $user->id)->where('is_completed', false)->count();
+            $completed = Task::where('user_id', $user->id)->where('is_completed', true)->count();
+            
+            $actions[] = [
+                'action' => 'get_stats',
+                'total' => $total,
+                'pending' => $pending,
+                'completed' => $completed
+            ];
+            
+            Log::info('Task stats', ['total' => $total, 'pending' => $pending, 'completed' => $completed]);
+        }
+
+        // ========================================
+        // 6. MARK AS INCOMPLETE (Bonus Feature!)
+        // ========================================
+        
+        if (preg_match('/(?:mark as incomplete|mark as not done|uncomplete|undo|reopen)/i', $message)) {
+            $searchTerm = preg_replace('/(mark as incomplete|mark as not done|uncomplete|undo|reopen|task|the)\s*/i', '', $message);
+            $searchTerm = trim($searchTerm);
+            
+            if ($searchTerm) {
+                $task = Task::where('user_id', $user->id)
+                            ->where('is_completed', true)
+                            ->where('title', 'LIKE', "%{$searchTerm}%")
+                            ->first();
+                
+                if ($task) {
+                    $task->is_completed = false;
+                    $task->save();
+                    $actions[] = [
+                        'action' => 'reopen_task',
+                        'task' => $task->title
+                    ];
+                    Log::info('Reopened task', ['title' => $task->title]);
+                }
+            }
+        }
+
+        // ========================================
+        // 7. SHOW COMPLETED TASKS (Bonus Feature!)
+        // ========================================
+        
+        if (preg_match('/(?:show|list|view)\s*(?:my)?\s*completed\s*(?:tasks?)/i', $message)) {
+            $tasks = Task::where('user_id', $user->id)
+                        ->where('is_completed', true)
+                        ->orderBy('updated_at', 'desc')
+                        ->limit(10)
+                        ->get(['title', 'priority', 'due_date']);
+            
+            $actions[] = [
+                'action' => 'list_completed',
+                'tasks' => $tasks->toArray()
+            ];
+            
+            Log::info('Listed completed tasks', ['count' => $tasks->count()]);
+        }
+
+        return $actions;
+    }
+
+    /**
+     * Build action summary for user
+     */
+    private function buildActionSummary($actions)
+    {
+        $summaries = [];
+
+        foreach ($actions as $action) {
+            switch ($action['action']) {
+                case 'delete_all':
+                    $summaries[] = "Deleted {$action['count']} task(s) from your list.";
+                    break;
+                case 'delete_completed':
+                    $summaries[] = "Deleted {$action['count']} completed task(s).";
+                    break;
+                case 'delete_task':
+                    $summaries[] = "Deleted task: \"{$action['task']}\".";
+                    break;
+                case 'complete_all':
+                    $summaries[] = "Marked {$action['count']} task(s) as completed.";
+                    break;
+                case 'complete_task':
+                    $summaries[] = "Completed task: \"{$action['task']}\".";
+                    break;
+                case 'create_task':
+                    $due = isset($action['due_date']) && $action['due_date'] 
+                        ? " (due: {$action['due_date']})" 
+                        : "";
+                    $priority = isset($action['priority']) 
+                        ? " [" . strtoupper($action['priority']) . "]" 
+                        : "";
+                    $summaries[] = "Created new task: \"{$action['task']}\"{$priority}{$due}.";
+                    break;
+                case 'list_tasks':
+                    if (empty($action['tasks'])) {
+                        $summaries[] = "You have no pending tasks! 🎉";
+                    } else {
+                        $taskList = "Your pending tasks:\n";
+                        foreach ($action['tasks'] as $task) {
+                            $priority = strtoupper($task['priority']);
+                            $emoji = $task['priority'] === 'high' ? '🔴' : ($task['priority'] === 'medium' ? '🟡' : '🟢');
+                            $due = $task['due_date'] ? " (due: {$task['due_date']})" : "";
+                            $taskList .= "  {$emoji} {$task['title']} ({$priority}){$due}\n";
+                        }
+                        $summaries[] = trim($taskList);
+                    }
+                    break;
+                case 'get_stats':
+                    $summaries[] = "Task Stats: {$action['total']} total, {$action['pending']} pending, {$action['completed']} completed.";
+                    break;
+                case 'reopen_task':
+                    $summaries[] = "Reopened task: \"{$action['task']}\".";
+                    break;
+                case 'list_completed':
+                    if (empty($action['tasks'])) {
+                        $summaries[] = "You haven't completed any tasks yet.";
+                    } else {
+                        $taskList = "Your completed tasks:\n";
+                        foreach ($action['tasks'] as $task) {
+                            $priority = strtoupper($task['priority']);
+                            $emoji = $task['priority'] === 'high' ? '🔴' : ($task['priority'] === 'medium' ? '🟡' : '🟢');
+                            $due = $task['due_date'] ? " (was due: {$task['due_date']})" : "";
+                            $taskList .= "  {$emoji} {$task['title']} ({$priority}){$due}\n";
+                        }
+                        $summaries[] = trim($taskList);
+                    }
+                    break;
+            }
+        }
+
+        return implode("\n", $summaries);
+    }
+
+    /**
+     * Get current date info
+     */
+    private function getCurrentDateInfo()
+    {
+        $now = now();
+        return $now->format('l, F j, Y');
+    }
+
+    /**
+     * Document Analysis (with CORS)
+     */
+    public function analyzeDocument(Request $request)
+    {
+        try {
+            $request->validate([
+                'document_text' => 'required|string'
+            ]);
+
+            $documentText = $request->document_text;
+
+            $prompt = "Extract tasks from this text. Return JSON only:\n\n{$documentText}\n\nJSON format:\n{\"tasks\":[{\"title\":\"\",\"priority\":\"\",\"estimated_hours\":2}]}";
+
+            $aiResponse = $this->callOllama($prompt, 0.3, 1000);
+
+            if (!$aiResponse) {
+                throw new \Exception('AI unavailable');
+            }
+
+            $tasks = $this->parseDocumentTasks($aiResponse);
+
+            return $this->corsResponse([
+                'success' => true,
+                'data' => [
+                    'tasks' => $tasks,
+                    'raw_response' => $aiResponse
+                ]
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Document analysis error: ' . $e->getMessage());
+            
+            return $this->corsResponse([
+                'success' => false,
+                'message' => 'Document analysis failed'
+            ], 500);
+        }
+    }
+
+    /**
+     * Parse tasks from document analysis
+     */
+    private function parseDocumentTasks($response)
+    {
+        try {
+            $cleaned = preg_replace('/```json\s*/i', '', $response);
+            $cleaned = preg_replace('/```\s*/i', '', $cleaned);
+            $cleaned = trim($cleaned);
+
+            if (preg_match('/\{.*"tasks".*\}/s', $cleaned, $matches)) {
+                $cleaned = $matches[0];
+            }
+
+            $parsed = json_decode($cleaned, true);
+
+            return $parsed['tasks'] ?? [];
+
+        } catch (\Exception $e) {
+            Log::error('Document task parsing failed');
+            return [];
+        }
     }
 }

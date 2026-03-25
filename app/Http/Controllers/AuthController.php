@@ -10,6 +10,18 @@ use Illuminate\Validation\ValidationException;
 class AuthController extends Controller
 {
     /**
+     * Add CORS headers to response
+     */
+    private function corsResponse($data, $status = 200)
+    {
+        return response()->json($data, $status)
+            ->header('Access-Control-Allow-Origin', '*')
+            ->header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS')
+            ->header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept')
+            ->header('Access-Control-Allow-Credentials', 'true');
+    }
+
+    /**
      * Register new user
      */
     public function register(Request $request)
@@ -28,7 +40,7 @@ class AuthController extends Controller
 
         $token = $user->createToken('auth_token')->accessToken;
 
-        return response()->json([
+        return $this->corsResponse([
             'success' => true,
             'message' => 'User registered successfully',
             'data' => [
@@ -44,14 +56,12 @@ class AuthController extends Controller
      */
     public function login(Request $request)
     {
-
         $request->validate([
             'email' => 'required|email',
             'password' => 'required',
         ]);
 
         $user = User::where('email', $request->email)->first();
-
 
         if (!$user || !Hash::check($request->password, $user->password)) {
             throw ValidationException::withMessages([
@@ -61,7 +71,7 @@ class AuthController extends Controller
 
         $token = $user->createToken('auth_token')->accessToken;
 
-        return response()->json([
+        return $this->corsResponse([
             'success' => true,
             'message' => 'Login successful',
             'data' => [
@@ -79,7 +89,7 @@ class AuthController extends Controller
     {
         $request->user()->token()->revoke();
 
-        return response()->json([
+        return $this->corsResponse([
             'success' => true,
             'message' => 'Logged out successfully'
         ]);
@@ -90,7 +100,7 @@ class AuthController extends Controller
      */
     public function user(Request $request)
     {
-        return response()->json([
+        return $this->corsResponse([
             'success' => true,
             'data' => $request->user()
         ]);

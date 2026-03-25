@@ -197,31 +197,96 @@ CRITICAL: Return ONLY the JSON object.";
 
         $prompt = "You are the COORDINATOR AGENT. Respond with ONLY valid JSON, nothing else.
 
-GOAL: {$goal}
+    GOAL: {$goal}
 
-ALL AGENT INPUTS:
-{$allAnalysis}
+    ALL AGENT INPUTS:
+    {$allAnalysis}
 
-Respond with ONLY this JSON (no markdown, no explanations):
-{
-  \"executive_summary\": \"Brief overview\",
-  \"final_tasks\": [
+    PRIORITY ASSIGNMENT RULES (CRITICAL PATH ANALYSIS):
+
+    Use CRITICAL PATH methodology to assign priorities:
+
+    HIGH PRIORITY (🔴) - Assign when ALL of these are true:
+    1. Task is on the CRITICAL PATH (blocks other essential tasks)
+    2. Task has tight deadline OR is time-sensitive
+    3. Without this task, the goal cannot be achieved
+    4. Task cannot be done in parallel with others
+
+    Examples of HIGH priority:
+    - Core development work that everything depends on
+    - Final deliverables with hard deadlines
+    - Preparation tasks that directly block launch/completion
+    - Tasks that must be done sequentially (can't parallelize)
+
+    MEDIUM PRIORITY (🟡) - Assign when:
+    1. Task is important but can be done in PARALLEL
+    2. Task supports the goal but doesn't block critical path
+    3. Task has moderate deadline (not immediate)
+    4. Task can be delayed slightly without major impact
+
+    Examples of MEDIUM priority:
+    - Research and planning (can be done alongside development)
+    - Marketing/promotional work (parallel to core work)
+    - Testing (continuous, parallel activity)
+    - Documentation and support materials
+
+    LOW PRIORITY (🟢) - Assign when:
+    1. Task is optional or nice-to-have
+    2. Task has distant deadline (many months/years away)
+    3. Task is exploratory with no immediate impact
+    4. Task can be postponed without consequences
+
+    Examples of LOW priority:
+    - Future enhancements or improvements
+    - Long-term strategic planning
+    - Optional features
+    - Tasks for goals with multi-year timelines
+
+    TIMELINE-BASED PRIORITY ADJUSTMENT:
+    - Goals with 0-1 month timeline: 50% HIGH, 40% MEDIUM, 10% LOW
+    - Goals with 2-3 month timeline: 40% HIGH, 50% MEDIUM, 10% LOW
+    - Goals with 4-12 month timeline: 20% HIGH, 60% MEDIUM, 20% LOW
+    - Goals with 1+ year timeline: 10% HIGH, 40% MEDIUM, 50% LOW
+
+    CRITICAL PATH IDENTIFICATION:
+    For sequential tasks (A → B → C → D):
+    - If B depends on A, and C depends on B: A, B, C are all HIGH (critical path)
+    - If X can be done anytime in parallel: X is MEDIUM
+
+    ESTIMATED HOURS GUIDELINES:
+    - Quick research/setup: 1-4 hours
+    - Standard feature development: 4-12 hours
+    - Complex implementation: 12-40 hours
+    - Major system development: 40-160 hours
+    - Learning entirely new skills: 20-80 hours
+
+    Respond with ONLY this JSON (no markdown, no explanations):
     {
-      \"title\": \"Task title\",
-      \"description\": \"Description\",
-      \"priority\": \"high\",
-      \"phase\": \"Phase 1\",
-      \"estimated_hours\": 10
+    \"executive_summary\": \"Brief overview highlighting critical path\",
+    \"final_tasks\": [
+        {
+        \"title\": \"Task title\",
+        \"description\": \"What needs to be done and why it matters\",
+        \"priority\": \"high\" | \"medium\" | \"low\",
+        \"phase\": \"Phase 1\" | \"Phase 2\" | \"Phase 3\",
+        \"estimated_hours\": 10
+        }
+    ],
+    \"key_insights\": [\"Critical path insight\", \"Risk/blocker insight\"],
+    \"next_steps\": [\"Immediate action 1\", \"Immediate action 2\"]
     }
-  ],
-  \"key_insights\": [\"Insight 1\"],
-  \"next_steps\": [\"Step 1\"]
-}
 
-CRITICAL: Return ONLY the JSON object.";
+    CRITICAL REMINDERS:
+    - Analyze task dependencies - blocking tasks are HIGH
+    - Consider the goal's timeline when assigning priorities
+    - Final deliverable and its direct dependencies are usually HIGH
+    - Parallel/supporting tasks are usually MEDIUM
+    - Be realistic - not everything is HIGH priority
+    - Return ONLY the JSON object.";
 
         return $this->callOpenAI($prompt, 'coordinator');
     }
+
 
     /**
      * Call OpenAI API for a specific agent
@@ -319,28 +384,34 @@ CRITICAL: Return ONLY the JSON object.";
         foreach ($coordinatorResult['final_tasks'] as $taskData) {
             $description = $taskData['description'] ?? '';
             
-            if (isset($taskData['priority'])) {
-                $description .= "\n\nPriority: " . $taskData['priority'];
-            }
-            
             if (isset($taskData['phase'])) {
-                $description .= "\nPhase: " . $taskData['phase'];
+                $description .= "\n\nPhase: " . $taskData['phase'];
             }
             
             if (isset($taskData['estimated_hours'])) {
                 $description .= "\nEstimated: " . $taskData['estimated_hours'] . " hours";
             }
 
+            // Map priority to lowercase (high/medium/low)
+            $priority = 'medium'; // default
+            if (isset($taskData['priority'])) {
+                $priority = strtolower($taskData['priority']);
+            }
+
+            // Create task with priority and estimated hours
             $task = $user->tasks()->create([
                 'title' => $taskData['title'],
                 'description' => $description,
+                'priority' => $priority,
+                'estimated_hours' => $taskData['estimated_hours'] ?? null,
                 'is_completed' => false
             ]);
 
             $createdTasks[] = [
                 'id' => $task->id,
                 'title' => $task->title,
-                'priority' => $taskData['priority'] ?? 'medium',
+                'priority' => $task->priority,
+                'estimated_hours' => $task->estimated_hours,
                 'phase' => $taskData['phase'] ?? 'Phase 1'
             ];
         }

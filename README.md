@@ -175,7 +175,7 @@ curl -X POST http://127.0.0.1:8000/api/register \
 **Example - Create Task:**
 ```bash
 curl -X POST http://127.0.0.1:8000/api/tasks \
-  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Authorisation: Bearer YOUR_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "title": "Deploy to production",
@@ -189,7 +189,7 @@ curl -X POST http://127.0.0.1:8000/api/tasks \
 | Method | Endpoint | Description | Auth Required |
 |--------|----------|-------------|---------------|
 | POST | `/api/ai/chat` | Natural language chat | Yes |
-| POST | `/api/ai/analyze` | Analyze task | Yes |
+| POST | `/api/ai/analyze` | Analyse task | Yes |
 | POST | `/api/ai/analyze-document` | Extract tasks from document | Yes |
 | POST | `/api/multi-agent/process` | Multi-agent goal processing | Yes |
 
